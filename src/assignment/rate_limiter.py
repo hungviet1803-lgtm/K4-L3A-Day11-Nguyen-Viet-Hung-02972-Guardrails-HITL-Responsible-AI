@@ -37,13 +37,17 @@ class RateLimitPlugin(base_plugin.BasePlugin):
         now = time.time()
         window = self.user_windows[user_id]
 
-        # TODO: Implement sliding window:
-        # 1. Pop timestamps older than (now - window_seconds) from the left
-        # 2. If len(window) >= max_requests:
-        #       wait = window_seconds - (now - window[0])
-        #       self.blocked_count += 1
-        #       return self._block_response(
-        #           f"Rate limit exceeded. Try again in {wait:.0f}s."
-        #       )
-        # 3. Else: append now, return None
-        raise NotImplementedError("Implement RateLimitPlugin.on_user_message_callback")
+        while window and window[0] <= now - self.window_seconds:
+            window.popleft()
+
+        if len(window) >= self.max_requests:
+            wait = self.window_seconds - (now - window[0])
+            self.blocked_count += 1
+            # Rejected requests are not recorded, so a blocked user regains
+            # access exactly when their oldest accepted request expires.
+            return self._block_response(
+                f"Rate limit exceeded. Try again in {max(wait, 0):.0f}s."
+            )
+
+        window.append(now)
+        return None

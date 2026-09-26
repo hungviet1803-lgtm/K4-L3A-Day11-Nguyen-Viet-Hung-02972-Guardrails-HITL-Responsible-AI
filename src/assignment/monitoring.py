@@ -41,17 +41,55 @@ class MonitoringAlert:
     judge_checks: int = 0
     judge_fails: int = 0
 
+    def record(self, *, blocked: bool, layer: str | None) -> None:
+        """Update counters after one request has finished."""
+        self.total_requests += 1
+        if blocked:
+            self.blocked_requests += 1
+        if layer == "rate_limiter":
+            self.rate_limit_hits += 1
+
+    def record_judge(self, *, safe: bool) -> None:
+        self.judge_checks += 1
+        if not safe:
+            self.judge_fails += 1
+
     def check_metrics(self) -> list[Alert]:
-        """TODO: compute rates, append Alert objects when thresholds exceeded."""
-        raise NotImplementedError("Implement MonitoringAlert.check_metrics")
+        """Compute rates and append an Alert for each threshold exceeded.
+
+        A metric that is already alerting is not re-added, so calling this
+        after every request does not flood the list.
+        """
+        snap = self.snapshot()
+        checks = [
+            ("block_rate", snap["block_rate"], self.block_rate_threshold,
+             "Block rate above threshold — possible attack campaign or over-blocking."),
+            ("rate_limit_hits", self.rate_limit_hits, self.rate_limit_hit_threshold,
+             "Many rate-limit hits — possible flooding / cost attack."),
+            ("judge_fail_rate", snap["judge_fail_rate"], self.judge_fail_rate_threshold,
+             "LLM judge rejects many replies — model output quality/safety degraded."),
+        ]
+        active = {a.metric for a in self.alerts}
+        new_alerts = []
+        for metric, value, threshold, message in checks:
+            if value > threshold and metric not in active:
+                alert = Alert(metric=metric, value=value, threshold=threshold, message=message)
+                self.alerts.append(alert)
+                new_alerts.append(alert)
+        return new_alerts
 
     def export_json(self, filepath: str | None = None):
-        """TODO: write metrics + alerts to JSON under repo-root ``outputs/`` by default.
-        Use ``filepath or default_metrics_path()`` so running from ``src/`` does not
-        create ``src/outputs/``.
-        """
-        _ = filepath or default_metrics_path()
-        raise NotImplementedError("Implement MonitoringAlert.export_json")
+        """Write metrics + alerts to JSON under repo-root ``outputs/`` by default."""
+        path = Path(filepath or default_metrics_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = self.snapshot()
+        data["thresholds"] = {
+            "block_rate": self.block_rate_threshold,
+            "rate_limit_hits": self.rate_limit_hit_threshold,
+            "judge_fail_rate": self.judge_fail_rate_threshold,
+        }
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        return str(path)
 
     def snapshot(self) -> dict:
         block_rate = (

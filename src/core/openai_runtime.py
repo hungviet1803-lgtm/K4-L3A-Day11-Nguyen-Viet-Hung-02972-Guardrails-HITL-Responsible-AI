@@ -46,10 +46,38 @@ class OpenAIRunner:
     input_hooks: list[Callable[[str], str | None]] = field(default_factory=list)
     output_hooks: list[Callable[[str], str]] = field(default_factory=list)
 
+    fallback_models: list[str] = field(default_factory=list)
+    last_model_used: str | None = None
+
     def _client(self):
         from openai import OpenAI
 
         return OpenAI(**(self.client_kwargs or {}))
+
+    def _complete(self, client, messages):
+        """Call ``self.model``; on "no endpoints" 404 try ``fallback_models``
+        (same model on another OpenRouter tier). Rate-limit 429s are retried
+        with backoff. ``last_model_used`` records which slug answered."""
+        import time
+        from openai import NotFoundError, RateLimitError
+
+        candidates = [self.model, *self.fallback_models]
+        for i, model in enumerate(candidates):
+            for attempt in range(4):
+                try:
+                    completion = client.chat.completions.create(
+                        model=model, messages=messages, temperature=self.temperature
+                    )
+                    self.last_model_used = model
+                    return completion
+                except NotFoundError:
+                    if i == len(candidates) - 1:
+                        raise
+                    break  # try next candidate
+                except RateLimitError:
+                    if attempt == 3:
+                        raise
+                    time.sleep(5 * (attempt + 1))
 
     async def chat(self, agent: OpenAIAgent, user_message: str) -> str:
         for hook in self.input_hooks:
@@ -62,14 +90,11 @@ class OpenAIRunner:
             return block_msg
 
         client = self._client()
-        completion = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": agent.instruction},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=self.temperature,
-        )
+        messages = [
+            {"role": "system", "content": agent.instruction},
+            {"role": "user", "content": user_message},
+        ]
+        completion = self._complete(client, messages)
         text = (completion.choices[0].message.content or "").strip()
 
         for hook in self.output_hooks:
@@ -166,6 +191,7 @@ def _make_pair(
     input_hooks: list | None = None,
     output_hooks: list | None = None,
     temperature: float = 0.4,
+    fallback_models: list[str] | None = None,
 ) -> tuple[OpenAIAgent, OpenAIRunner]:
     agent = OpenAIAgent(name=name, instruction=instruction, provider=provider)
     runner = OpenAIRunner(
@@ -177,6 +203,7 @@ def _make_pair(
         input_hooks=list(input_hooks or []),
         output_hooks=list(output_hooks or []),
         temperature=temperature,
+        fallback_models=list(fallback_models or []),
     )
     return agent, runner
 
@@ -203,6 +230,8 @@ def create_blue_pair(
         input_hooks=input_hooks,
         output_hooks=output_hooks,
         temperature=temperature,
+        # Same locked model; OpenRouter currently serves it only on ":free".
+        fallback_models=[f"{get_blue_model()}:free"],
     )
 
 

@@ -6,12 +6,14 @@ Checkpoint 2 — Output Guardrails
 """
 import re
 import textwrap
+import unicodedata
 
 from google.genai import types
 from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
@@ -37,29 +39,52 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = unicodedata.normalize("NFKC", response or "")
+    redacted = "".join(ch for ch in redacted if unicodedata.category(ch) != "Cf")
 
-    # PII patterns to check
+    # Order matters: secrets first, then longer digit runs (12-digit CCCD)
+    # before phone numbers so one number is not counted twice.
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "api_key": r"\bsk-[a-z0-9][a-z0-9_-]{5,}",
+        "password": r"\b(?:password|passwd|pwd|mật\s*khẩu)\b\s*(?:is|là|[:=])\s*\S+",
+        "internal_host": r"\b[\w-]+(?:\.[\w-]+)*\.(?:internal|local|corp)(?::\d{2,5})?\b",
+        "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}",
+        "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
+        "phone": r"(?<!\d)(?:\+84|0)\d{9,10}(?!\d)",
     }
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Known protected values may slip past the patterns above when the model
+    # spaces or punctuates them ("a d m i n 1 2 3"). Compare on an
+    # alphanumeric-only view; such text cannot be redacted in place, so the
+    # plugin must replace the whole reply.
+    compact = re.sub(r"[^a-z0-9]", "", redacted.casefold())
+    if any(needle in compact for needle in _SECRET_NEEDLES):
+        issues.append("protected_secret: obfuscated value found")
 
     return {
         "safe": len(issues) == 0,
         "issues": issues,
         "redacted": redacted,
     }
+
+
+_SECRET_NEEDLES = sorted({
+    re.sub(r"[^a-z0-9]", "", s.casefold()) for s in DEMO_SECRETS if s
+} - {""})
+
+# Issue types that mean internal data reached the reply → fail closed.
+_SECRET_ISSUES = ("api_key", "password", "internal_host", "protected_secret")
+
+SAFE_BLOCK_MESSAGE = (
+    "I cannot share internal system details. "
+    "How else can I help with your VinBank account or banking needs?"
+)
 
 
 # ============================================================
@@ -172,16 +197,31 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        result = content_filter(response_text)
+        if not result["safe"]:
+            if any(issue.startswith(_SECRET_ISSUES) for issue in result["issues"]):
+                # Internal data in a customer reply: drop the whole answer,
+                # since surrounding text may still hint at the value.
+                self.blocked_count += 1
+                safe_text = SAFE_BLOCK_MESSAGE
+            else:
+                # Customer PII only: keep the answer, mask the values.
+                self.redacted_count += 1
+                safe_text = result["redacted"]
+            llm_response.content = types.Content(
+                role="model", parts=[types.Part.from_text(text=safe_text)]
+            )
+            return llm_response
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model", parts=[types.Part.from_text(text=SAFE_BLOCK_MESSAGE)]
+                )
+
+        return llm_response
 
 
 # ============================================================
